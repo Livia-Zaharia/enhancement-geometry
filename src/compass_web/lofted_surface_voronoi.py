@@ -235,6 +235,38 @@ def make_bounding_box(bounds: tuple[float, float, float, float, float, float]) -
     return pv.Box(bounds=bounds)
 
 
+def rebuild_polylines_from_discontinuities(
+    polylines: list[np.ndarray],
+    tolerance: float,
+    discontinuity_angle_degrees: float = 176.0,
+    neighbor_snap_tolerance: float | None = None,
+) -> list[np.ndarray]:
+    rebuilt_polylines: list[np.ndarray] = []
+    for polyline in polylines:
+        unique_points = _unique_polyline_points(polyline, tolerance=tolerance)
+        if len(unique_points) < 3:
+            continue
+        straight_polyline, _ = _build_straight_polyline_from_discontinuities(
+            unique_points,
+            tolerance=tolerance,
+            discontinuity_angle_degrees=discontinuity_angle_degrees,
+        )
+        rebuilt_polyline = _sanitize_closed_polyline(straight_polyline, tolerance=tolerance)
+        if len(_unique_polyline_points(rebuilt_polyline, tolerance=tolerance)) < 3:
+            continue
+        rebuilt_polylines.append(rebuilt_polyline)
+
+    if not rebuilt_polylines:
+        return []
+
+    snap_tolerance = neighbor_snap_tolerance if neighbor_snap_tolerance is not None else max(20.0 * tolerance, 0.02)
+    return _snap_neighboring_polyline_points(
+        rebuilt_polylines,
+        tolerance=tolerance,
+        snap_tolerance=snap_tolerance,
+    )
+
+
 def analyze_and_generate_surfaces(
     polylines: list[np.ndarray],
     loft_bounds: tuple[float, float, float, float, float, float],
@@ -244,6 +276,7 @@ def analyze_and_generate_surfaces(
     small_cell_extrusion_factor: float = 0.1,
     extrusion_scale_origin: np.ndarray | tuple[float, float, float] | None = None,
     planar_scale_factors: tuple[float, float] = (1.0, 1.0),
+    slice_plane_x: float | None = None,
 ) -> SurfaceGenerationResult:
     loft_bbox_center = np.array(
         [
@@ -262,13 +295,8 @@ def analyze_and_generate_surfaces(
         if len(unique_points) < 3:
             continue
 
-        discontinuity_indices = _detect_discontinuity_indices(unique_points, discontinuity_angle_degrees)
-        clustered_indices = _cluster_cyclic_indices(discontinuity_indices, len(unique_points), max_gap=0)
-        if len(clustered_indices) < 3:
-            clustered_indices = _fallback_sample_indices(len(unique_points), minimum_count=3)
-
-        discontinuity_points = unique_points[clustered_indices]
-        followup_polyline = np.vstack([unique_points, unique_points[0]])
+        discontinuity_points = unique_points.copy()
+        followup_polyline = _sanitize_closed_polyline(polyline, tolerance=tolerance)
 
         plane_origin, plane_u, plane_v, plane_normal = _fit_plane(unique_points)
         circle_center, circle_radius = _fit_circle_on_plane(unique_points, plane_origin, plane_u, plane_v)
@@ -334,19 +362,26 @@ def analyze_and_generate_surfaces(
     for analysis in analyses:
         if analysis.ratio >= average_ratio:
             offset_vector = extrusion_multiplier * analysis.extrusion_base_vector
-            moved_scaled_polyline = _scale_and_offset_polyline(
+            staged_loft_mesh, _, _ = _build_staged_offset_lofts(
                 analysis.followup_polyline,
                 center=analysis.circle_center,
                 plane_u=analysis.plane_u,
                 plane_v=analysis.plane_v,
-                scale_factor=0.5,
                 offset_vector=offset_vector,
             )
-            larger_meshes.append(_loft_between_polylines(analysis.followup_polyline, moved_scaled_polyline))
+            larger_meshes.append(staged_loft_mesh)
         else:
             offset_vector = small_cell_extrusion_factor * extrusion_multiplier * analysis.extrusion_base_vector
             moved_center = analysis.circle_center + offset_vector
-            smaller_meshes.append(_fan_surface_from_center(moved_center, analysis.discontinuity_points))
+            small_mesh = _fan_surface_from_center(moved_center, analysis.discontinuity_points)
+            if _small_mesh_exceeds_retained_volume(
+                small_mesh,
+                loft_bounds=loft_bounds,
+                slice_plane_x=slice_plane_x,
+                tolerance=tolerance,
+            ):
+                continue
+            smaller_meshes.append(small_mesh)
 
     larger_surface = _merge_meshes(larger_meshes)
     smaller_surface = _merge_meshes(smaller_meshes)
@@ -577,6 +612,78 @@ def _build_straight_polyline_from_discontinuities(
         straight_points = np.vstack([straight_points, straight_points[0]])
 
     return straight_points, points[clustered_indices]
+
+
+def _snap_neighboring_polyline_points(
+    polylines: list[np.ndarray],
+    tolerance: float,
+    snap_tolerance: float,
+) -> list[np.ndarray]:
+    if len(polylines) < 2 or snap_tolerance <= tolerance:
+        return [_sanitize_closed_polyline(polyline, tolerance=tolerance) for polyline in polylines]
+
+    polyline_points = [_unique_polyline_points(polyline, tolerance=tolerance).copy() for polyline in polylines]
+    point_refs: list[tuple[int, int]] = []
+    flat_points: list[np.ndarray] = []
+    for polyline_index, points in enumerate(polyline_points):
+        for point_index, point in enumerate(points):
+            point_refs.append((polyline_index, point_index))
+            flat_points.append(point)
+
+    if len(flat_points) < 2:
+        return [_sanitize_closed_polyline(polyline, tolerance=tolerance) for polyline in polylines]
+
+    points_array = np.array(flat_points, dtype=float)
+    parents = list(range(len(points_array)))
+    ranks = [0] * len(points_array)
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(first: int, second: int) -> None:
+        root_first = find(first)
+        root_second = find(second)
+        if root_first == root_second:
+            return
+        if ranks[root_first] < ranks[root_second]:
+            parents[root_first] = root_second
+        elif ranks[root_first] > ranks[root_second]:
+            parents[root_second] = root_first
+        else:
+            parents[root_second] = root_first
+            ranks[root_first] += 1
+
+    for first_index, first_point in enumerate(points_array[:-1]):
+        first_polyline_index, _ = point_refs[first_index]
+        for second_index in range(first_index + 1, len(points_array)):
+            second_polyline_index, _ = point_refs[second_index]
+            if first_polyline_index == second_polyline_index:
+                continue
+            if float(np.linalg.norm(first_point - points_array[second_index])) <= snap_tolerance:
+                union(first_index, second_index)
+
+    cluster_members: dict[int, list[int]] = defaultdict(list)
+    for index in range(len(points_array)):
+        cluster_members[find(index)].append(index)
+
+    snapped_points = points_array.copy()
+    for member_indices in cluster_members.values():
+        if len(member_indices) < 2:
+            continue
+        snapped_location = points_array[member_indices].mean(axis=0)
+        snapped_points[member_indices] = snapped_location
+
+    for flat_index, (polyline_index, point_index) in enumerate(point_refs):
+        polyline_points[polyline_index][point_index] = snapped_points[flat_index]
+
+    return [
+        _sanitize_closed_polyline(_close_polyline(points, tolerance=tolerance), tolerance=tolerance)
+        for points in polyline_points
+        if len(points) >= 3
+    ]
 
 
 def _detect_discontinuity_indices(points: np.ndarray, discontinuity_angle_degrees: float) -> list[int]:
@@ -833,6 +940,33 @@ def _polyline_length(polyline: np.ndarray) -> float:
     return float(np.linalg.norm(polyline[1:] - polyline[:-1], axis=1).sum())
 
 
+def _close_polyline(points: np.ndarray, tolerance: float) -> np.ndarray:
+    if len(points) == 0:
+        return points
+    if np.allclose(points[0], points[-1], atol=tolerance):
+        return points
+    return np.vstack([points, points[0]])
+
+
+def _sanitize_closed_polyline(polyline: np.ndarray, tolerance: float) -> np.ndarray:
+    unique_points = _unique_polyline_points(polyline, tolerance=tolerance)
+    if len(unique_points) == 0:
+        return np.zeros((0, 3), dtype=float)
+
+    cleaned_points = [unique_points[0]]
+    for point in unique_points[1:]:
+        if float(np.linalg.norm(point - cleaned_points[-1])) > tolerance:
+            cleaned_points.append(point)
+
+    cleaned_array = np.array(cleaned_points, dtype=float)
+    if len(cleaned_array) > 1 and float(np.linalg.norm(cleaned_array[0] - cleaned_array[-1])) <= tolerance:
+        cleaned_array = cleaned_array[:-1]
+
+    if len(cleaned_array) == 0:
+        return np.zeros((0, 3), dtype=float)
+    return np.vstack([cleaned_array, cleaned_array[0]])
+
+
 def _scale_and_offset_polyline(
     polyline: np.ndarray,
     center: np.ndarray,
@@ -848,6 +982,59 @@ def _scale_and_offset_polyline(
     scaled_points = center + scale_factor * u_coords[:, None] * plane_u + scale_factor * v_coords[:, None] * plane_v
     moved_points = scaled_points + offset_vector
     return np.vstack([moved_points, moved_points[0]])
+
+
+def _build_staged_offset_lofts(
+    polyline: np.ndarray,
+    center: np.ndarray,
+    plane_u: np.ndarray,
+    plane_v: np.ndarray,
+    offset_vector: np.ndarray,
+    primary_scale_factor: float = 0.5,
+    secondary_scale_ratio: float = 0.9,
+) -> tuple[pv.PolyData, np.ndarray, np.ndarray]:
+    first_scaled_polyline = _scale_and_offset_polyline(
+        polyline,
+        center=center,
+        plane_u=plane_u,
+        plane_v=plane_v,
+        scale_factor=primary_scale_factor,
+        offset_vector=offset_vector,
+    )
+    second_scaled_polyline = _scale_and_offset_polyline(
+        polyline,
+        center=center,
+        plane_u=plane_u,
+        plane_v=plane_v,
+        scale_factor=primary_scale_factor * secondary_scale_ratio,
+        offset_vector=offset_vector,
+    )
+    staged_mesh = _merge_meshes(
+        [
+            _loft_between_polylines(polyline, first_scaled_polyline),
+            _loft_between_polylines(first_scaled_polyline, second_scaled_polyline),
+        ]
+    )
+    return staged_mesh, first_scaled_polyline, second_scaled_polyline
+
+
+def _small_mesh_exceeds_retained_volume(
+    mesh: pv.PolyData,
+    loft_bounds: tuple[float, float, float, float, float, float],
+    tolerance: float,
+    slice_plane_x: float | None = None,
+) -> bool:
+    if mesh.n_points == 0:
+        return False
+
+    xmin, _, _, _, zmin, zmax = mesh.bounds
+    loft_zmin = loft_bounds[4]
+    loft_zmax = loft_bounds[5]
+
+    crosses_slice_plane = slice_plane_x is not None and xmin < slice_plane_x - tolerance
+    crosses_bottom_cap = zmin < loft_zmin - tolerance
+    crosses_top_cap = zmax > loft_zmax + tolerance
+    return bool(crosses_slice_plane or crosses_bottom_cap or crosses_top_cap)
 
 
 def _loft_between_polylines(first: np.ndarray, second: np.ndarray) -> pv.PolyData:
