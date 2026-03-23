@@ -11,7 +11,7 @@ import vtk
 from scipy.spatial import ConvexHull, HalfspaceIntersection
 
 MIN_RADIUS = 5.0
-MAX_RADIUS = 70.0
+MAX_RADIUS = 75.0
 MAX_MODEL_SPAN = 150.0
 
 
@@ -49,6 +49,8 @@ class CurveAnalysis:
     bbox_volume: float
     curve_length: float
     ratio: float
+    scaled_circle_center: np.ndarray
+    extrusion_base_vector: np.ndarray
     offset_direction: np.ndarray
 
 
@@ -239,10 +241,10 @@ def analyze_and_generate_surfaces(
     tolerance: float,
     discontinuity_angle_degrees: float = 176.0,
     extrusion_multiplier: float = 0.5,
+    small_cell_extrusion_factor: float = 0.1,
+    extrusion_scale_origin: np.ndarray | tuple[float, float, float] | None = None,
+    planar_scale_factors: tuple[float, float] = (1.0, 1.0),
 ) -> SurfaceGenerationResult:
-    if extrusion_multiplier < 0.0:
-        raise ValueError("extrusion_multiplier must be non-negative.")
-
     loft_bbox_center = np.array(
         [
             0.5 * (loft_bounds[0] + loft_bounds[1]),
@@ -251,6 +253,8 @@ def analyze_and_generate_surfaces(
         ],
         dtype=float,
     )
+    scale_origin = np.asarray(extrusion_scale_origin if extrusion_scale_origin is not None else loft_bbox_center, dtype=float)
+    scale_x, scale_y = planar_scale_factors
 
     analyses: list[CurveAnalysis] = []
     for polyline in polylines:
@@ -280,10 +284,13 @@ def analyze_and_generate_surfaces(
         if curve_length <= tolerance:
             continue
 
-        direction_vector = circle_center - loft_bbox_center
+        scaled_circle_center = circle_center.copy()
+        scaled_circle_center[0] = scale_origin[0] + scale_x * (scaled_circle_center[0] - scale_origin[0])
+        scaled_circle_center[1] = scale_origin[1] + scale_y * (scaled_circle_center[1] - scale_origin[1])
+        direction_vector = scaled_circle_center - circle_center
         direction_length = float(np.linalg.norm(direction_vector))
         if direction_length <= tolerance:
-            offset_direction = plane_normal
+            offset_direction = np.zeros(3, dtype=float)
         else:
             offset_direction = direction_vector / direction_length
 
@@ -303,6 +310,8 @@ def analyze_and_generate_surfaces(
                 bbox_volume=bbox_volume,
                 curve_length=curve_length,
                 ratio=bbox_volume / curve_length,
+                scaled_circle_center=scaled_circle_center,
+                extrusion_base_vector=direction_vector,
                 offset_direction=offset_direction,
             )
         )
@@ -323,10 +332,8 @@ def analyze_and_generate_surfaces(
     smaller_meshes: list[pv.PolyData] = []
 
     for analysis in analyses:
-        ratio_factor = analysis.ratio / average_ratio if average_ratio > tolerance else 1.0
-        offset_distance = extrusion_multiplier * ratio_factor
-        offset_vector = analysis.offset_direction * offset_distance
         if analysis.ratio >= average_ratio:
+            offset_vector = extrusion_multiplier * analysis.extrusion_base_vector
             moved_scaled_polyline = _scale_and_offset_polyline(
                 analysis.followup_polyline,
                 center=analysis.circle_center,
@@ -337,6 +344,7 @@ def analyze_and_generate_surfaces(
             )
             larger_meshes.append(_loft_between_polylines(analysis.followup_polyline, moved_scaled_polyline))
         else:
+            offset_vector = small_cell_extrusion_factor * extrusion_multiplier * analysis.extrusion_base_vector
             moved_center = analysis.circle_center + offset_vector
             smaller_meshes.append(_fan_surface_from_center(moved_center, analysis.discontinuity_points))
 
