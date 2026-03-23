@@ -62,6 +62,10 @@ class SurfaceGenerationResult:
     generated_surface: pv.PolyData
     larger_surface: pv.PolyData
     smaller_surface: pv.PolyData
+    uniform_cap_surface: pv.PolyData
+    scaled_uniform_cap_surface: pv.PolyData
+    uniform_cap_edge_loft_surface: pv.PolyData
+    uniform_cap_closed_surface: pv.PolyData
 
 
 def load_generation_config(path: str | Path) -> LoftedVoronoiConfig:
@@ -353,11 +357,16 @@ def analyze_and_generate_surfaces(
             generated_surface=empty,
             larger_surface=empty,
             smaller_surface=empty,
+            uniform_cap_surface=empty,
+            scaled_uniform_cap_surface=empty,
+            uniform_cap_edge_loft_surface=empty,
+            uniform_cap_closed_surface=empty,
         )
 
     average_ratio = float(np.mean([analysis.ratio for analysis in analyses]))
     larger_meshes: list[pv.PolyData] = []
     smaller_meshes: list[pv.PolyData] = []
+    uniform_cap_meshes: list[pv.PolyData] = []
 
     for analysis in analyses:
         if analysis.ratio >= average_ratio:
@@ -383,9 +392,47 @@ def analyze_and_generate_surfaces(
                 continue
             smaller_meshes.append(small_mesh)
 
+        uniform_cap_offset = small_cell_extrusion_factor * extrusion_multiplier * analysis.extrusion_base_vector
+        uniform_cap_center = analysis.circle_center + uniform_cap_offset
+        uniform_cap_mesh = _fan_surface_from_center(uniform_cap_center, analysis.discontinuity_points)
+        if _small_mesh_exceeds_retained_volume(
+            uniform_cap_mesh,
+            loft_bounds=loft_bounds,
+            slice_plane_x=slice_plane_x,
+            tolerance=tolerance,
+        ):
+            continue
+        uniform_cap_meshes.append(uniform_cap_mesh)
+
     larger_surface = _merge_meshes(larger_meshes)
     smaller_surface = _merge_meshes(smaller_meshes)
     generated_surface = _merge_meshes([mesh for mesh in [larger_surface, smaller_surface] if mesh.n_cells > 0])
+    uniform_cap_surface = _merge_meshes(uniform_cap_meshes)
+    scaled_uniform_cap_surface = _scale_mesh_xy(
+        uniform_cap_surface,
+        origin=scale_origin,
+        scale_x=scale_x,
+        scale_y=scale_y,
+    )
+    uniform_cap_edge_loft_surface = _loft_naked_edges_between_meshes(
+        uniform_cap_surface,
+        scaled_uniform_cap_surface,
+        scale_origin=scale_origin,
+        planar_scale_factors=planar_scale_factors,
+        tolerance=tolerance,
+    )
+    # Keep the experimental closure path separate so it can run alongside the current large/small logic.
+    uniform_cap_closed_surface = _merge_meshes(
+        [
+            mesh
+            for mesh in [
+                uniform_cap_surface,
+                scaled_uniform_cap_surface,
+                uniform_cap_edge_loft_surface,
+            ]
+            if mesh.n_cells > 0
+        ]
+    )
 
     return SurfaceGenerationResult(
         analyses=tuple(analyses),
@@ -394,6 +441,10 @@ def analyze_and_generate_surfaces(
         generated_surface=generated_surface,
         larger_surface=larger_surface,
         smaller_surface=smaller_surface,
+        uniform_cap_surface=uniform_cap_surface,
+        scaled_uniform_cap_surface=scaled_uniform_cap_surface,
+        uniform_cap_edge_loft_surface=uniform_cap_edge_loft_surface,
+        uniform_cap_closed_surface=uniform_cap_closed_surface,
     )
 
 
@@ -984,6 +1035,31 @@ def _scale_and_offset_polyline(
     return np.vstack([moved_points, moved_points[0]])
 
 
+def _scale_points_xy(
+    points: np.ndarray,
+    origin: np.ndarray,
+    scale_x: float,
+    scale_y: float,
+) -> np.ndarray:
+    scaled_points = np.array(points, dtype=float, copy=True)
+    scaled_points[:, 0] = origin[0] + scale_x * (scaled_points[:, 0] - origin[0])
+    scaled_points[:, 1] = origin[1] + scale_y * (scaled_points[:, 1] - origin[1])
+    return scaled_points
+
+
+def _scale_mesh_xy(
+    mesh: pv.PolyData,
+    origin: np.ndarray,
+    scale_x: float,
+    scale_y: float,
+) -> pv.PolyData:
+    if mesh.n_points == 0:
+        return pv.PolyData()
+    scaled_mesh = mesh.copy(deep=True)
+    scaled_mesh.points = _scale_points_xy(scaled_mesh.points, origin=origin, scale_x=scale_x, scale_y=scale_y)
+    return scaled_mesh
+
+
 def _build_staged_offset_lofts(
     polyline: np.ndarray,
     center: np.ndarray,
@@ -1069,6 +1145,119 @@ def _fan_surface_from_center(center: np.ndarray, polygon_points: np.ndarray) -> 
         faces.extend([3, 0, index + 1, next_index + 1])
 
     return pv.PolyData(points, faces=np.array(faces, dtype=np.int64)).triangulate().clean()
+
+
+def _extract_naked_edge_polylines(mesh: pv.PolyData, tolerance: float) -> list[np.ndarray]:
+    if mesh.n_points == 0:
+        return []
+    naked_edges = mesh.extract_feature_edges(
+        boundary_edges=True,
+        non_manifold_edges=False,
+        feature_edges=False,
+        manifold_edges=False,
+    )
+    if naked_edges.n_points == 0 or naked_edges.n_lines == 0:
+        return []
+    return _extract_polylines(naked_edges.clean(), tolerance=tolerance)
+
+
+def _resample_closed_polyline(polyline: np.ndarray, sample_count: int, tolerance: float) -> np.ndarray:
+    unique_points = _unique_polyline_points(_sanitize_closed_polyline(polyline, tolerance=tolerance), tolerance=tolerance)
+    if len(unique_points) < 3 or sample_count < 3:
+        return np.zeros((0, 3), dtype=float)
+    if len(unique_points) == sample_count:
+        return _close_polyline(unique_points, tolerance=tolerance)
+
+    next_points = np.roll(unique_points, -1, axis=0)
+    segment_vectors = next_points - unique_points
+    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
+    total_length = float(segment_lengths.sum())
+    if total_length <= tolerance:
+        return _close_polyline(unique_points, tolerance=tolerance)
+
+    cumulative_lengths = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+    targets = np.linspace(0.0, total_length, sample_count, endpoint=False)
+    resampled_points: list[np.ndarray] = []
+    for target in targets:
+        segment_index = int(np.searchsorted(cumulative_lengths, target, side="right") - 1)
+        segment_index = min(segment_index, len(unique_points) - 1)
+        segment_start = unique_points[segment_index]
+        segment_end = unique_points[(segment_index + 1) % len(unique_points)]
+        segment_length = segment_lengths[segment_index]
+        if segment_length <= tolerance:
+            resampled_points.append(segment_start)
+            continue
+        local_distance = target - cumulative_lengths[segment_index]
+        interpolation = local_distance / segment_length
+        resampled_points.append(segment_start + interpolation * (segment_end - segment_start))
+
+    return _close_polyline(np.array(resampled_points, dtype=float), tolerance=tolerance)
+
+
+def _match_scaled_polyline_pairs(
+    first_polylines: list[np.ndarray],
+    second_polylines: list[np.ndarray],
+    scale_origin: np.ndarray,
+    planar_scale_factors: tuple[float, float],
+) -> list[tuple[int, int]]:
+    if not first_polylines or not second_polylines:
+        return []
+
+    scale_x, scale_y = planar_scale_factors
+    expected_centers = [
+        _scale_points_xy(polyline[:-1].mean(axis=0, keepdims=True), origin=scale_origin, scale_x=scale_x, scale_y=scale_y)[0]
+        for polyline in first_polylines
+    ]
+    available_indices = set(range(len(second_polylines)))
+    pairings: list[tuple[int, int]] = []
+    for first_index, expected_center in enumerate(expected_centers):
+        if not available_indices:
+            break
+        second_index = min(
+            available_indices,
+            key=lambda candidate_index: float(
+                np.linalg.norm(second_polylines[candidate_index][:-1].mean(axis=0) - expected_center)
+            ),
+        )
+        available_indices.remove(second_index)
+        pairings.append((first_index, second_index))
+    return pairings
+
+
+def _loft_naked_edges_between_meshes(
+    first_mesh: pv.PolyData,
+    second_mesh: pv.PolyData,
+    scale_origin: np.ndarray,
+    planar_scale_factors: tuple[float, float],
+    tolerance: float,
+) -> pv.PolyData:
+    if first_mesh.n_points == 0 or second_mesh.n_points == 0:
+        return pv.PolyData()
+
+    first_polylines = _extract_naked_edge_polylines(first_mesh, tolerance=tolerance)
+    second_polylines = _extract_naked_edge_polylines(second_mesh, tolerance=tolerance)
+    if not first_polylines or not second_polylines:
+        return pv.PolyData()
+
+    loft_meshes: list[pv.PolyData] = []
+    for first_index, second_index in _match_scaled_polyline_pairs(
+        first_polylines,
+        second_polylines,
+        scale_origin=scale_origin,
+        planar_scale_factors=planar_scale_factors,
+    ):
+        first_polyline = _sanitize_closed_polyline(first_polylines[first_index], tolerance=tolerance)
+        second_polyline = _sanitize_closed_polyline(second_polylines[second_index], tolerance=tolerance)
+        first_count = len(_unique_polyline_points(first_polyline, tolerance=tolerance))
+        second_count = len(_unique_polyline_points(second_polyline, tolerance=tolerance))
+        sample_count = max(first_count, second_count)
+        first_resampled = _resample_closed_polyline(first_polyline, sample_count=sample_count, tolerance=tolerance)
+        second_resampled = _resample_closed_polyline(second_polyline, sample_count=sample_count, tolerance=tolerance)
+        if len(first_resampled) == 0 or len(second_resampled) == 0:
+            continue
+        loft_meshes.append(_loft_between_polylines(first_resampled, second_resampled))
+
+    return _merge_meshes(loft_meshes)
 
 
 def _merge_meshes(meshes: list[pv.PolyData]) -> pv.PolyData:
