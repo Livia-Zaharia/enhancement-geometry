@@ -393,7 +393,10 @@ def count_connected_regions(mesh: pv.PolyData) -> int:
 def extract_surface_mesh(mesh: pv.PolyData) -> pv.PolyData:
     if mesh.n_points == 0 or mesh.n_cells == 0:
         return pv.PolyData()
-    return mesh.extract_surface(algorithm="dataset_surface").triangulate().clean()
+    surface = mesh.extract_surface(algorithm="dataset_surface").clean()
+    if surface.n_cells > 0:
+        surface = surface.triangulate()
+    return surface
 
 
 def unify_mesh_normals(mesh: pv.PolyData) -> pv.PolyData:
@@ -1081,6 +1084,95 @@ def _split_branch_boundaries(
             current = next_v
 
     return loops
+
+
+def align_loops_and_loft(
+    loop_a: np.ndarray,
+    loop_b: np.ndarray,
+    tolerance: float,
+) -> pv.PolyData:
+    a_closed = np.allclose(loop_a[0], loop_a[-1], atol=tolerance)
+    b_closed = np.allclose(loop_b[0], loop_b[-1], atol=tolerance)
+    a_unique = loop_a[:-1] if a_closed else loop_a
+    b_unique = loop_b[:-1] if b_closed else loop_b
+
+    if len(a_unique) != len(b_unique) or len(a_unique) < 2:
+        return pv.PolyData()
+
+    dists = np.linalg.norm(b_unique - a_unique[0:1], axis=1)
+    offset = int(np.argmin(dists))
+
+    if offset != 0:
+        b_unique = np.roll(b_unique, -offset, axis=0)
+
+    a_loop = np.vstack([a_unique, a_unique[0:1]])
+    b_loop = np.vstack([b_unique, b_unique[0:1]])
+    return _loft_between_polylines(a_loop, b_loop)
+
+
+def project_loop_to_plane(
+    loop: np.ndarray,
+    plane_axis: int,
+    plane_coord: float,
+) -> np.ndarray:
+    projected = loop.copy()
+    projected[:, plane_axis] = plane_coord
+    return projected
+
+
+def split_and_offset_plane_faces(
+    mesh: pv.PolyData,
+    plane_normal: tuple[float, float, float],
+    plane_origin: tuple[float, float, float],
+    offset_amount: float = -2.0,
+    tolerance: float = 1e-4,
+) -> tuple[pv.PolyData, pv.PolyData]:
+    plane_axis = int(np.argmax(np.abs(plane_normal)))
+    plane_coord = float(plane_origin[plane_axis])
+
+    if mesh.n_points == 0 or mesh.n_cells == 0:
+        return mesh, pv.PolyData()
+
+    points = np.asarray(mesh.points, dtype=float)
+    faces_raw = np.asarray(mesh.faces, dtype=int)
+    face_verts: list[tuple[int, int, int]] = []
+    cursor = 0
+    while cursor < len(faces_raw):
+        n = int(faces_raw[cursor])
+        if n == 3:
+            face_verts.append((int(faces_raw[cursor + 1]), int(faces_raw[cursor + 2]), int(faces_raw[cursor + 3])))
+        cursor += n + 1
+
+    plane_fi: list[int] = []
+    body_fi: list[int] = []
+    for fi, (a, b, c) in enumerate(face_verts):
+        center_on_axis = float((points[a] + points[b] + points[c])[plane_axis] / 3.0)
+        if abs(center_on_axis - plane_coord) < tolerance * 50:
+            plane_fi.append(fi)
+        else:
+            body_fi.append(fi)
+
+    if not plane_fi:
+        return mesh, pv.PolyData()
+
+    body_faces: list[int] = []
+    for fi in body_fi:
+        a, b, c = face_verts[fi]
+        body_faces.extend([3, a, b, c])
+    body_mesh = pv.PolyData(points.copy(), faces=np.array(body_faces, dtype=np.int64)) if body_faces else pv.PolyData()
+
+    plane_faces: list[int] = []
+    for fi in plane_fi:
+        a, b, c = face_verts[fi]
+        plane_faces.extend([3, a, b, c])
+    plane_mesh = pv.PolyData(points.copy(), faces=np.array(plane_faces, dtype=np.int64))
+    plane_mesh = plane_mesh.clean().triangulate()
+
+    moved_points = np.asarray(plane_mesh.points, dtype=float).copy()
+    moved_points[:, plane_axis] += offset_amount
+    plane_mesh.points = moved_points
+
+    return body_mesh, plane_mesh
 
 
 def filter_closed_meshes(
@@ -2023,7 +2115,7 @@ def _loft_between_polylines(first: np.ndarray, second: np.ndarray) -> pv.PolyDat
         d = point_count + index
         faces.extend([3, a, b, c, 3, a, c, d])
 
-    return pv.PolyData(points, faces=np.array(faces, dtype=np.int64)).triangulate().clean()
+    return pv.PolyData(points, faces=np.array(faces, dtype=np.int64)).clean()
 
 
 def _fan_surface_from_center(center: np.ndarray, polygon_points: np.ndarray) -> pv.PolyData:
@@ -2037,7 +2129,42 @@ def _fan_surface_from_center(center: np.ndarray, polygon_points: np.ndarray) -> 
         next_index = (index + 1) % len(unique_points)
         faces.extend([3, 0, index + 1, next_index + 1])
 
-    return pv.PolyData(points, faces=np.array(faces, dtype=np.int64)).triangulate().clean()
+    return pv.PolyData(points, faces=np.array(faces, dtype=np.int64)).clean()
+
+
+def orient_normals_outward(mesh: pv.PolyData) -> pv.PolyData:
+    if mesh.n_cells < 2:
+        return mesh
+
+    points = np.asarray(mesh.points, dtype=float)
+    faces_raw = np.asarray(mesh.faces, dtype=int)
+    face_verts: list[list[int]] = []
+    cursor = 0
+    while cursor < len(faces_raw):
+        n = int(faces_raw[cursor])
+        if n == 3:
+            face_verts.append([int(faces_raw[cursor + 1]), int(faces_raw[cursor + 2]), int(faces_raw[cursor + 3])])
+        cursor += n + 1
+
+    if not face_verts:
+        return mesh
+
+    center = points.mean(axis=0)
+    changed = False
+    for fi, (a, b, c) in enumerate(face_verts):
+        face_center = (points[a] + points[b] + points[c]) / 3.0
+        normal = np.cross(points[b] - points[a], points[c] - points[a])
+        if float(np.dot(normal, face_center - center)) < 0:
+            face_verts[fi] = [a, c, b]
+            changed = True
+
+    if not changed:
+        return mesh
+
+    new_faces: list[int] = []
+    for a, b, c in face_verts:
+        new_faces.extend([3, a, b, c])
+    return pv.PolyData(points.copy(), faces=np.array(new_faces, dtype=np.int64))
 
 
 def _fix_mesh_winding(mesh: pv.PolyData) -> pv.PolyData:
@@ -2107,7 +2234,7 @@ def _merge_meshes(meshes: list[pv.PolyData]) -> pv.PolyData:
     merged = non_empty[0].copy()
     for mesh in non_empty[1:]:
         merged = merged.merge(mesh)
-    return merged.clean().triangulate()
+    return merged.clean()
 
 
 def _bounds_overlap(
