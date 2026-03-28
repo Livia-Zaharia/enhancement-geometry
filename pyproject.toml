@@ -1,7 +1,7 @@
 [project]
 name = "compass-web"
 version = "0.1.0"
-description = "Add your description here"
+description = "Generate 3D-printable voronoi shell geometry from parametric inputs."
 readme = "README.md"
 authors = [
     { name = "antonkulaga", email = "antonkulaga@gmail.com" }
@@ -16,7 +16,11 @@ dependencies = [
     "pyvista>=0.47.1",
     "scipy>=1.17.1",
     "trimesh>=4.11.5",
+    "typer>=0.15",
 ]
+
+[project.scripts]
+materialize = "compass_web.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.10.0,<0.11.0"]
