@@ -2,6 +2,8 @@
 
 Generate **3D-printable voronoi shell geometry** from parametric inputs. Each run produces a unique shape driven by radius, spacing, seed, and extrusion parameters, exported as STL.
 
+> **Full API reference:** see [API.md](API.md) for complete documentation of all functions, dataclasses, constants, and CLI options.
+
 ## Quick start
 
 ```bash
